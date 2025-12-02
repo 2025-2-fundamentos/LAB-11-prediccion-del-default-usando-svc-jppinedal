@@ -95,3 +95,156 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import json
+import gzip
+import pickle
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
+from sklearn.metrics import make_scorer
+
+def pregunta_1():
+    def load_data(path: str) -> pd.DataFrame:
+        return pd.read_csv(path, index_col=False, compression="zip")
+
+    def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.rename(columns={"default payment next month": "default"})
+        df.drop(columns=["ID"], errors="ignore", inplace=True)
+
+        df = df[df["MARRIAGE"] != 0]
+        df = df[df["EDUCATION"] != 0]
+        df["EDUCATION"] = df["EDUCATION"].apply(lambda x: x if x in [1, 2, 3] else 4)
+
+        return df.dropna()
+
+    # ------------------------------
+    #   PIPELINE Y GRID SEARCH
+    # ------------------------------
+    def make_pipeline(x_train: pd.DataFrame) -> Pipeline:
+        cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+        num_cols = [c for c in x_train.columns if c not in cat_cols]
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+                ("scaler", StandardScaler(), num_cols),
+            ],
+            remainder="passthrough",
+        )
+
+        return Pipeline(
+            steps=[
+                ("prep", preprocessor),
+                ("pca", PCA()),
+                ("select", SelectKBest(score_func=f_classif)),
+                ("clf", SVC(kernel="rbf", random_state=12345, max_iter=-1)),
+            ]
+        )
+
+    def optimize_pipeline(pipeline: Pipeline, X: pd.DataFrame, y: pd.Series) -> GridSearchCV:
+        param_grid = {
+            "pca__n_components": [20, X.shape[1] - 2],
+            "select__k": [12],
+            "clf__kernel": ["rbf"],
+            "clf__gamma": [0.1],
+        }
+
+        cv = StratifiedKFold(n_splits=10)
+        scorer = make_scorer(balanced_accuracy_score)
+
+        gs = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            scoring=scorer,
+            cv=cv,
+            n_jobs=-1,
+        )
+
+        gs.fit(X, y)
+        return gs
+
+    # ------------------------------
+    #       GUARDADO MODELO
+    # ------------------------------
+    def save_model(model, path="files/models/model.pkl.gz") -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with gzip.open(path, "wb") as f:
+            pickle.dump(model, f)
+
+    # ------------------------------
+    #         MÉTRICAS
+    # ------------------------------
+    def pack_metrics(y_true, y_pred, dataset: str) -> dict:
+        return {
+            "type": "metrics",
+            "dataset": dataset,
+            "precision": round(precision_score(y_true, y_pred, zero_division=0), 4),
+            "balanced_accuracy": round(balanced_accuracy_score(y_true, y_pred), 4),
+            "recall": round(recall_score(y_true, y_pred), 4),
+            "f1_score": round(f1_score(y_true, y_pred), 4),
+        }
+
+    def pack_confusion(y_true, y_pred, dataset: str) -> dict:
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        return {
+            "type": "cm_matrix",
+            "dataset": dataset,
+            "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+            "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+        }
+
+    def save_jsonl(items: list, path="files/output/metrics.json", append=False) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mode = "a" if append else "w"
+        with open(path, mode, encoding="utf-8") as fh:
+            for item in items:
+                fh.write(json.dumps(item) + "\n")
+
+    # ------------------------------
+    #          EJECUCIÓN
+    # ------------------------------
+    train = clean_data(load_data("files/input/train_data.csv.zip"))
+    test = clean_data(load_data("files/input/test_data.csv.zip"))
+
+    X_train, y_train = train.drop(columns=["default"]), train["default"]
+    X_test, y_test = test.drop(columns=["default"]), test["default"]
+
+    pipeline = make_pipeline(X_train)
+    estimator = optimize_pipeline(pipeline, X_train, y_train)
+
+    save_model(estimator)
+
+    y_train_pred = estimator.best_estimator_.predict(X_train)
+    y_test_pred = estimator.best_estimator_.predict(X_test)
+
+    # métricas
+    metrics = [
+        pack_metrics(y_train, y_train_pred, "train"),
+        pack_metrics(y_test, y_test_pred, "test"),
+    ]
+    save_jsonl(metrics)
+
+    # matrices
+    cms = [
+        pack_confusion(y_train, y_train_pred, "train"),
+        pack_confusion(y_test, y_test_pred, "test"),
+    ]
+    save_jsonl(cms, append=True)
+
+
+if __name__ == "__main__":
+    pregunta_1()
